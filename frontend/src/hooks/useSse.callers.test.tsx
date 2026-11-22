@@ -28,7 +28,7 @@ const envelope = (id: string, type: string) =>
     data: JSON.stringify({
       id,
       type,
-      sequence: 1,
+      sequence: Number(id.slice(2)) + (id.startsWith('o-') ? 4 : 0),
       timestamp: new Date().toISOString(),
       userId: 'u1',
       payload: { n: id },

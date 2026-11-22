@@ -7,13 +7,13 @@ import { z } from 'zod';
 import { queryKeys } from '../lib/queryClient';
 import { useUIStore } from '../store/uiStore';
 import { useUserStore } from '../store/userStore';
+import { EventSequenceBuffer } from '../features/realtime/eventBuffer';
 
 const SSE_PATH = '/events';
 const RECONNECT_DELAY_MS = 3_000;
 const MAX_RECONNECT_DELAY_MS = 30_000;
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const MAX_CONSECUTIVE_FAILURES = 5;
-const MAX_SEEN_ENVELOPE_IDS = 1000;
 // A connection has to stay open this long before earlier failures are forgiven, so a server that
 // accepts and immediately drops keeps backing off (same idea as STABLE_CONNECTION_MS in
 // lib/realtime/sse-manager.ts).
@@ -184,19 +184,22 @@ const store: StoreState = {
 
 const MAX_HISTORY = 50;
 const seenEventIds = new Set<string>();
-const seenEnvelopeIds = new Set<string>();
 
 function eventKey(event: SseEvent): string {
   return `${event.type}:${event.timestamp}:${JSON.stringify(event.stats || event.payload || '')}`;
 }
 
-function rememberEnvelopeId(id: string): void {
-  seenEnvelopeIds.add(id);
-  if (seenEnvelopeIds.size > MAX_SEEN_ENVELOPE_IDS) {
-    const first = seenEnvelopeIds.values().next().value;
-    if (first !== undefined) seenEnvelopeIds.delete(first);
-  }
-}
+let recoverGap: () => void = () => {};
+const eventBuffer = new EventSequenceBuffer<{ event: SseEvent; cursor?: string }>(
+  ({ value, id }) => {
+    const generation = connectGeneration;
+    dispatchEvent(value.event, id);
+    if (generation === connectGeneration && value.cursor && !eventBuffer.hasGap) {
+      store.lastEventId = value.cursor;
+    }
+  },
+  () => recoverGap(),
+);
 
 type Listener = () => void;
 const listeners = new Set<Listener>();
@@ -373,12 +376,25 @@ async function openGlobalStream(
   const url = `${envUrl}${SSE_PATH}?${urlParams.toString()}`;
   const es = new EventSource(url);
   globalEventSource = es;
+  recoverGap = () => {
+    if (es !== globalEventSource) return;
+    console.warn('[SSE] Sequence gap unresolved; attempting replay.');
+    updateDegraded(true);
+    clearStabilityTimer();
+    stopHeartbeatWatchdog();
+    es.close();
+    globalEventSource = null;
+    eventBuffer.reconnect();
+    scheduleReconnect(false, updateStatus, updateDegraded);
+  };
   // The watchdog only judges a stream once it has seen a `heartbeat` event on it. A server that
   // only sends `: heartbeat` comment lines (which browsers never hand to the page) would
   // otherwise look dead after a quiet minute and get reconnected in a loop.
   let serverSendsHeartbeatEvents = false;
 
   es.onopen = () => {
+    if (es !== globalEventSource) return;
+    eventBuffer.resume();
     const now = Date.now();
     globalLastMessage = now;
     store.connectedAt = now;
@@ -424,6 +440,7 @@ async function openGlobalStream(
       const elapsed = Date.now() - globalLastMessage;
       if (elapsed > HEARTBEAT_INTERVAL_MS * 2) {
         console.warn('[SSE] Heartbeat dead, initiating reconnect.', { elapsed });
+        eventBuffer.reconnect();
         es.close();
         globalEventSource = null;
         stopHeartbeatWatchdog();
@@ -434,6 +451,7 @@ async function openGlobalStream(
 
   // The server keepalive is a named `heartbeat` event (a bare `: comment` never reaches the page).
   es.addEventListener('heartbeat', () => {
+    if (es !== globalEventSource) return;
     serverSendsHeartbeatEvents = true;
     globalLastMessage = Date.now();
     // No emitChange: status readers poll getSseDiagnostics(), so heartbeats don't re-render the app.
@@ -441,29 +459,24 @@ async function openGlobalStream(
   });
 
   es.onmessage = (ev) => {
+    if (es !== globalEventSource) return;
     globalLastMessage = Date.now();
     if (ev.data?.startsWith(':')) return;
 
     let event: SseEvent;
-    let envelopeId: string | null = null;
+    let envelopeId: string | undefined;
+    let sequence: number | undefined;
 
     try {
       const parsedRaw = JSON.parse(ev.data);
-      envelopeId = ev.lastEventId || parsedRaw?.id || null;
-
-      // Deduplicate by envelope ID before parsing or dispatching mutations
-      if (envelopeId && seenEnvelopeIds.has(envelopeId)) {
-        return;
-      }
+      envelopeId = typeof parsedRaw?.id === 'string' ? parsedRaw.id : undefined;
       
       // Perform Zod validation on event envelope structure
       const parsedEnvelope = SseEventEnvelopeSchema.safeParse(parsedRaw);
       if (parsedEnvelope.success) {
         const data = parsedEnvelope.data;
         envelopeId = data.id;
-        if (seenEnvelopeIds.has(envelopeId)) {
-          return;
-        }
+        sequence = data.sequence;
         event = {
           type: data.type as SseEventType,
           timestamp: data.timestamp,
@@ -471,7 +484,6 @@ async function openGlobalStream(
           stats: data.payload as SseEvent['stats'],
           payload: data.payload,
         };
-        store.lastEventId = data.id;
       } else {
         event = parsedRaw as SseEvent;
       }
@@ -480,41 +492,20 @@ async function openGlobalStream(
       return;
     }
 
-    if (envelopeId) {
-      rememberEnvelopeId(envelopeId);
-    }
-
-    const key = eventKey(event);
-    if (seenEventIds.has(key)) return;
-    seenEventIds.add(key);
-    if (seenEventIds.size > 200) {
-      const first = seenEventIds.values().next().value;
-      if (first) seenEventIds.delete(first);
-    }
-
-    store.eventHistory = [event, ...store.eventHistory].slice(0, MAX_HISTORY);
-    store.lastEvent = event;
-    store.lastEventAt = Date.now();
-    store.totalEventsReceived++;
-    store.consecutiveFailures = 0;
-    emitChange();
-
-    for (const cb of activeCallbacks) {
-      try {
-        cb.onEvent?.(event);
-        invalidateOnSyncEvent(cb.queryClient, event);
-        if (!cb.invalidateOn || cb.invalidateOn.includes(event.type)) {
-          for (const k of cb.extraInvalidateKeys) {
-            cb.queryClient.invalidateQueries({ queryKey: k });
-          }
-        }
-      } catch (e) {
-        console.error('[SSE] Broadcast dispatch failure: ', e);
-      }
-    }
+    const buffered = {
+      id: envelopeId,
+      sequence,
+      value: { event, cursor: envelopeId && /^\d+-\d+$/.test(envelopeId) ? envelopeId : undefined },
+    };
+    if (event.type === 'runtime_state_full' && sequence === 0) {
+      if (eventBuffer.hasGap) console.warn('[SSE] Runtime snapshot received after an unresolved sequence gap.');
+      eventBuffer.acceptSnapshot(buffered);
+    } else eventBuffer.accept(buffered);
   };
 
   es.onerror = () => {
+    if (es !== globalEventSource) return;
+    eventBuffer.reconnect();
     clearStabilityTimer();
     stopHeartbeatWatchdog();
     globalConsecutiveFailures += 1;
@@ -541,10 +532,45 @@ async function openGlobalStream(
   };
 }
 
+function dispatchEvent(event: SseEvent, id?: string): void {
+  if (!id) {
+    const key = eventKey(event);
+    if (seenEventIds.has(key)) return;
+    seenEventIds.add(key);
+    if (seenEventIds.size > 200) {
+      const first = seenEventIds.values().next().value;
+      if (first) seenEventIds.delete(first);
+    }
+  }
+
+  store.eventHistory = [event, ...store.eventHistory].slice(0, MAX_HISTORY);
+  store.lastEvent = event;
+  store.lastEventAt = Date.now();
+  store.totalEventsReceived++;
+  store.consecutiveFailures = 0;
+  emitChange();
+
+  for (const cb of activeCallbacks) {
+    try {
+      cb.onEvent?.(event);
+      invalidateOnSyncEvent(cb.queryClient, event);
+      if (!cb.invalidateOn || cb.invalidateOn.includes(event.type)) {
+        for (const k of cb.extraInvalidateKeys) {
+          cb.queryClient.invalidateQueries({ queryKey: k });
+        }
+      }
+    } catch (e) {
+      console.error('[SSE] Broadcast dispatch failure: ', e);
+    }
+  }
+}
+
 export function disconnectGlobalSse(
   setSseStatus?: (status: 'connected' | 'reconnecting' | 'disconnected') => void
 ) {
   const updateStatus = setSseStatus || ((status) => useUIStore.getState().setSseStatus(status));
+  eventBuffer.dispose();
+  seenEventIds.clear();
 
   // Cancel any connect that is still waiting for its token or ticket.
   connectGeneration += 1;
@@ -703,7 +729,6 @@ export function getSseDiagnostics(): SseDiagnostics {
 
 export function __resetSseForTests(): void {
   disconnectGlobalSse();
-  seenEnvelopeIds.clear();
   seenEventIds.clear();
   userStoreSubscribed = false;
   previousAuth = false;

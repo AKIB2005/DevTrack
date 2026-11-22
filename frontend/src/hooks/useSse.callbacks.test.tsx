@@ -23,7 +23,7 @@ const envelope = (id: string, type: string) =>
     data: JSON.stringify({
       id,
       type,
-      sequence: 1,
+      sequence: Number(id.split('-')[0]),
       timestamp: new Date().toISOString(),
       userId: 'u1',
       payload: { n: id },
@@ -62,6 +62,51 @@ afterEach(() => {
 });
 
 describe('useSse callbacks', () => {
+  it('keeps the replay cursor behind buffered events after a transport error', async () => {
+    const { sse, rtl, wrapper } = await setup();
+    const hook = rtl.renderHook(() => sse.useSse(), { wrapper });
+    await rtl.act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    const first = FakeEventSource.instances[0];
+    first.onopen!();
+    first.onmessage!(envelope('1-0', 'xp_updated'));
+    first.onmessage!(envelope('3-0', 'level_up'));
+    first.onerror!();
+    await rtl.act(async () => { await vi.advanceTimersByTimeAsync(3_000); });
+    const second = FakeEventSource.instances[1];
+    second.onopen!();
+    second.onmessage!({ data: JSON.stringify({ id: '4-0', type: 'sync_started', timestamp: 't' }), lastEventId: '4-0' } as MessageEvent);
+    second.onerror!();
+    await rtl.act(async () => { await vi.advanceTimersByTimeAsync(4_500); });
+    const third = FakeEventSource.instances[2];
+    expect(new URL(third.url, 'http://localhost').searchParams.get('lastEventId')).toBe('1-0');
+    hook.unmount();
+  });
+
+  it('shares ordered delivery and reconnects from the last delivered cursor after a gap', async () => {
+    const { sse, rtl, wrapper } = await setup();
+    const first: string[] = [];
+    const second: string[] = [];
+    const a = rtl.renderHook(() => sse.useSse({ onEvent: e => first.push(e.type) }), { wrapper });
+    const b = rtl.renderHook(() => sse.useSse({ onEvent: e => second.push(e.type) }), { wrapper });
+    await rtl.act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    const es = FakeEventSource.instances[0];
+    es.onopen!();
+    es.onmessage!(envelope('1-0', 'xp_updated'));
+    es.onmessage!(envelope('3-0', 'level_up'));
+    expect(first).toEqual(['xp_updated']);
+    await rtl.act(async () => { await vi.advanceTimersByTimeAsync(200); });
+    expect(es.close).toHaveBeenCalled();
+    await rtl.act(async () => { await vi.advanceTimersByTimeAsync(3_000); });
+    const replay = FakeEventSource.instances[1];
+    expect(new URL(replay.url, 'http://localhost').searchParams.get('lastEventId')).toBe('1-0');
+    replay.onmessage!(envelope('2-0', 'notification_created'));
+    replay.onmessage!(envelope('3-0', 'level_up'));
+    expect(first).toEqual(['xp_updated', 'notification_created', 'level_up']);
+    expect(second).toEqual(first);
+    a.unmount();
+    b.unmount();
+  });
+
   it('delivers events to the onEvent of the latest render, not the first one', async () => {
     const { sse, rtl, wrapper } = await setup();
     const seen: string[] = [];
