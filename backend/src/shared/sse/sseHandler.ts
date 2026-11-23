@@ -130,6 +130,8 @@ export async function replayMissedEvents(
           timestamp: fieldsObj.timestamp,
           userId,
           payload: JSON.parse(fieldsObj.payload),
+          ...(fieldsObj.protocolVersion === '2' && fieldsObj.generation
+            ? { protocolVersion: 2, generation: fieldsObj.generation } : {}),
         };
 
         const payload = `id: ${envelope.id}\ndata: ${JSON.stringify(envelope)}\n\n`;

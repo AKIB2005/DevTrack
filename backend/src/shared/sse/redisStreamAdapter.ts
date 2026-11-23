@@ -406,6 +406,9 @@ export class RedisStreamAdapter extends EventEmitter {
 
     const event: ShardedStreamEvent = {
       id: msgId,
+      canonicalId: fieldsObj.canonicalId || undefined,
+      protocolVersion: fieldsObj.protocolVersion === '2' ? 2 : undefined,
+      generation: fieldsObj.generation || undefined,
       origin: fieldsObj.origin || '',
       userId: fieldsObj.userId || '',
       type: (fieldsObj.type || 'runtime_state_patch') as any,
@@ -469,7 +472,9 @@ export class RedisStreamAdapter extends EventEmitter {
         'correlationId',
         event.correlationId || '',
         'schemaVersion',
-        String(event.schemaVersion || 1)
+        String(event.schemaVersion || 1),
+        ...(event.canonicalId ? ['canonicalId', event.canonicalId] : []),
+        ...(event.protocolVersion === 2 && event.generation ? ['protocolVersion', '2', 'generation', event.generation] : [])
       );
 
       this.totalEventsPublished++;

@@ -20,6 +20,37 @@ env:
   NODE_VERSION: '22'
 
 jobs:
+  sse-replay-v2:
+    name: SSE replay v2 Redis (#513)
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7.0-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - name: Install backend dependencies
+        working-directory: backend
+        run: npm ci
+      - name: Run Redis replay writer tests
+        working-directory: backend
+        env:
+          SSE_TEST_REDIS_URL: redis://127.0.0.1:6379
+        run: |
+          node node_modules/vitest/vitest.mjs run -c vitest.sse-replay-v2.config.ts --reporter=default --reporter=json --outputFile.json=sse-replay-v2-results.json
+          node -e 'const r = require("./sse-replay-v2-results.json"); if (!r.success || r.numTotalTests < 1 || r.numPassedTests !== r.numTotalTests || r.numPendingTests !== 0) { console.error("Redis tests were missing, skipped, or failed"); process.exit(1); }'
+
   contracts-openapi:
     name: OpenAPI Contract Drift
     runs-on: ubuntu-latest

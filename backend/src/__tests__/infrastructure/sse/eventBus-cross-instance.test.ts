@@ -152,17 +152,31 @@ describe('EventBus cross-instance delivery over shared Redis', () => {
     busB.register(client);
 
     const event: SseEvent = {
+      id: '1700000000000-5',
       type: 'runtime_state_patch',
       timestamp: new Date().toISOString(),
       userId: 'user-1',
       payload: { xp: 42 },
     };
-    busA.publish(event, 'user-1');
+    busA.publish(event, 'user-1', event.id);
     await new Promise((resolve) => setTimeout(resolve, 20));
 
     const received = chunks.join('');
     expect(received).toContain('data: ');
     expect(received).toContain('"xp":42');
+    expect(received).toContain('id: 1700000000000-5\n');
+
+    busB.streamAdapter.emit('message', { id: '1800000000000-1', canonicalId: event.id,
+      origin: 'other', userId: 'user-1', type: event.type, timestamp: event.timestamp, payload: event.payload });
+    expect(chunks.filter(chunk => chunk.includes('id: 1700000000000-5\n'))).toHaveLength(1);
+    expect(chunks.join('')).not.toContain('1800000000000-1');
+
+    const next = { ...event, id: '1700000000000-6' };
+    busB.streamAdapter.emit('message', { id: '1800000000000-2', canonicalId: next.id,
+      origin: 'other', userId: 'user-1', type: next.type, timestamp: next.timestamp, payload: next.payload });
+    busA.publish(next, 'user-1', next.id);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(chunks.filter(chunk => chunk.includes('id: 1700000000000-6\n'))).toHaveLength(1);
 
     busA.shutdown();
     busB.shutdown();

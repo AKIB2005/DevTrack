@@ -5,6 +5,9 @@ import { SseEventType } from './eventBus.js';
 
 export interface ShardedStreamEvent {
   id?: string;
+  canonicalId?: string;
+  protocolVersion?: number;
+  generation?: string;
   origin: string;
   userId: string;
   type: SseEventType;

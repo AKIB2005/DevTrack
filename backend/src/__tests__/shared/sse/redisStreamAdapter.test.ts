@@ -277,6 +277,7 @@ describe('RedisStreamAdapter Core & Sharding', () => {
       userId: 'usr_prod_delta_100',
       type: 'runtime_state_patch' as const,
       sequence: 1,
+      canonicalId: '1700000000000-7',
       timestamp: new Date().toISOString(),
       payload: { xpDelta: 50 },
     };
@@ -292,6 +293,7 @@ describe('RedisStreamAdapter Core & Sharding', () => {
     expect(addCall?.fields[0]).toBe('MAXLEN');
     expect(addCall?.fields[1]).toBe('~');
     expect(addCall?.fields[2]).toBe(10_000);
+    expect(addCall?.fields.slice(-2)).toEqual(['canonicalId', '1700000000000-7']);
   });
 
   it('reads messages from shard and sends immediate XACK for bounded PEL', async () => {
@@ -321,13 +323,17 @@ describe('RedisStreamAdapter Core & Sharding', () => {
       'payload',
       JSON.stringify({ newLevel: 5 }),
       'timestamp',
-      new Date().toISOString()
+      new Date().toISOString(),
+      'canonicalId',
+      '1700000000000-7'
     );
 
     const received = await messagePromise;
     expect(received.event.userId).toBe(userId);
     expect(received.event.type).toBe('level_up');
     expect(received.event.payload).toEqual({ newLevel: 5 });
+    expect(received.event.id).toBe(addedId);
+    expect(received.event.canonicalId).toBe('1700000000000-7');
 
     // Verify XACK was invoked for received message ID
     await new Promise((r) => setTimeout(r, 20));

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const redis = {
+  eval: vi.fn(),
   incr: vi.fn(async () => 1),
   expire: vi.fn(async () => 1),
   xtrim: vi.fn(async () => 0),
@@ -96,6 +97,101 @@ describe('runtime_state_patch coalescing', () => {
 });
 
 describe('live event ids', () => {
+  it('uses the opt-in v2 append result for live identity and metadata', async () => {
+    process.env.SSE_V2_WRITER_ENABLED = 'true';
+    const bus = new EventBus();
+    const publish = vi.spyOn(bus, 'publish').mockImplementation(() => undefined);
+    redis.eval.mockResolvedValueOnce(['1700000000123-2', 'generation', '1']);
+    try {
+      await bus.publishEnvelope('u', 'runtime_state_patch', { a: 1 });
+      expect(redis.eval).toHaveBeenCalledWith(expect.any(String), 1, 'sse:stream:u', expect.any(String),
+        'runtime_state_patch', '{"a":1}', expect.any(String), expect.any(String), '1');
+      expect(publish).toHaveBeenCalledWith(expect.objectContaining({ id: '1700000000123-2',
+        protocolVersion: 2, generation: 'generation', sequence: 1 }), 'u', '1700000000123-2');
+    } finally {
+      delete process.env.SSE_V2_WRITER_ENABLED;
+      bus.shutdown();
+    }
+  });
+
+  it('does not publish a v2 event when the append fails', async () => {
+    process.env.SSE_V2_WRITER_ENABLED = 'true';
+    const bus = new EventBus();
+    const publish = vi.spyOn(bus, 'publish');
+    redis.eval.mockRejectedValueOnce(new Error('append failed'));
+    try {
+      await expect(bus.publishEnvelope('u', 'runtime_state_patch', { a: 1 })).rejects.toThrow('append failed');
+      expect(publish).not.toHaveBeenCalled();
+    } finally {
+      delete process.env.SSE_V2_WRITER_ENABLED;
+      bus.shutdown();
+    }
+  });
+  it('forwards the canonical ID to both shard publication paths', async () => {
+    const bus = new EventBus();
+    const shard = vi.spyOn(bus.streamAdapter, 'publishEvent').mockResolvedValue(null);
+    const publish = vi.spyOn(bus, 'publish').mockImplementation(() => undefined);
+    redis.xadd.mockResolvedValueOnce('1700000000123-2');
+    await bus.publishEnvelope('u', 'runtime_state_patch', { a: 1 });
+    expect(shard).toHaveBeenCalledWith(expect.objectContaining({ canonicalId: '1700000000123-2' }));
+    expect(publish.mock.calls[0][0].id).toBe('1700000000123-2');
+    expect(publish.mock.calls[0][2]).toBe('1700000000123-2');
+    bus.shutdown();
+  });
+
+  it('delivers a canonical shard ID instead of its transport ID', () => {
+    const bus = new EventBus();
+    const frames: string[] = [];
+    bus.register({ id: 'client', userId: 'u', connectedAt: Date.now(),
+      controller: { enqueue: (b: Uint8Array) => frames.push(new TextDecoder().decode(b)) },
+      emit: () => undefined, destroy: () => undefined } as unknown as SseClient);
+    bus.streamAdapter.emit('message', { id: '999-0', canonicalId: '100-0', origin: 'peer',
+      userId: 'u', type: 'runtime_state_patch', timestamp: 't', payload: {} });
+    expect(frames[0]).toContain('id: 100-0\n');
+    expect(frames[0]).not.toContain('999-0');
+    bus.streamAdapter.emit('message', { id: '999-2', canonicalId: '100-0', origin: 'peer',
+      userId: 'u', type: 'runtime_state_patch', timestamp: 't', payload: {} });
+    expect(frames).toHaveLength(1);
+    bus.streamAdapter.emit('message', { id: '999-1', origin: 'peer', userId: 'u',
+      type: 'interview.turn.delta', timestamp: 't', payload: { delta: 'hi', seq: 1 } });
+    expect(frames[1]).not.toMatch(/^id:/m);
+    expect(frames[1]).not.toContain('999-1');
+    bus.shutdown();
+  });
+
+  it('does not discard equal transport IDs belonging to different users', () => {
+    const bus = new EventBus();
+    const frames: string[] = [];
+    for (const userId of ['u1', 'u2']) {
+      bus.register({ id: userId, userId, connectedAt: Date.now(),
+        controller: { enqueue: (b: Uint8Array) => frames.push(new TextDecoder().decode(b)) },
+        emit: () => undefined, destroy: () => undefined } as unknown as SseClient);
+      bus.streamAdapter.emit('message', { id: '999-0', origin: 'peer', userId,
+        type: 'runtime_state_patch', timestamp: 't', payload: { userId } });
+    }
+    expect(frames).toHaveLength(2);
+    expect(frames.join('')).toContain('u1');
+    expect(frames.join('')).toContain('u2');
+    bus.shutdown();
+  });
+
+  it('deduplicates legacy transport redelivery while preserving distinct ID-less events', () => {
+    const bus = new EventBus();
+    const frames: string[] = [];
+    bus.register({ id: 'c', userId: 'u', connectedAt: Date.now(),
+      controller: { enqueue: (b: Uint8Array) => frames.push(new TextDecoder().decode(b)) },
+      emit: () => undefined, destroy: () => undefined } as unknown as SseClient);
+    const legacy = { id: '999-0', origin: 'peer', userId: 'u', type: 'interview.turn.delta', timestamp: 't', payload: { seq: 1 } };
+    bus.streamAdapter.emit('message', legacy);
+    bus.streamAdapter.emit('message', legacy);
+    bus.streamAdapter.emit('message', { ...legacy, id: '999-1', payload: { seq: 2 } });
+    bus.streamAdapter.emit('message', { ...legacy, id: undefined, payload: { seq: 3 } });
+    bus.streamAdapter.emit('message', { ...legacy, id: undefined, payload: { seq: 4 } });
+    expect(frames).toHaveLength(4);
+    expect(frames.every(frame => !/^id:/m.test(frame))).toBe(true);
+    bus.shutdown();
+  });
+
   it('publishes the Redis Stream id the entry was stored under', async () => {
     const bus = new EventBus();
     const seen: string[] = [];
@@ -141,6 +237,34 @@ describe('replayMissedEvents', () => {
   }
 
   beforeEach(() => redis.xrange.mockClear());
+
+  it('preserves v2 metadata in replay', async () => {
+    redis.xrange.mockResolvedValueOnce([['1700000000001-0', [
+      'type', 'runtime_state_patch', 'sequence', '1', 'payload', '{}', 'timestamp', 't',
+      'protocolVersion', '2', 'generation', 'generation',
+    ]]]);
+    const { ctl, chunks } = controller();
+    await replayMissedEvents('u', '1700000000000-0', ctl);
+    expect(chunks[0]).toContain('"protocolVersion":2');
+    expect(chunks[0]).toContain('"generation":"generation"');
+    expect(chunks[0]).toContain('id: 1700000000001-0');
+  });
+
+  it('replays the IDs returned to concurrent live publishers', async () => {
+    const bus = new EventBus();
+    const publish = vi.spyOn(bus, 'publish').mockImplementation(() => undefined);
+    redis.xadd.mockResolvedValueOnce('1700000000001-0').mockResolvedValueOnce('1700000000001-1');
+    await Promise.all([
+      bus.publishEnvelope('u', 'runtime_state_patch', { x: 1 }),
+      bus.publishEnvelope('u', 'runtime_state_patch', { x: 2 }),
+    ]);
+    const liveIds = publish.mock.calls.map(([event]) => event.id);
+    redis.xrange.mockResolvedValueOnce([entry('1700000000001-0', 1), entry('1700000000001-1', 2)]);
+    const { ctl, chunks } = controller();
+    await replayMissedEvents('u', '1700000000000-0', ctl);
+    expect(chunks.map(chunk => chunk.split('\n')[0].slice(4))).toEqual(liveIds);
+    bus.shutdown();
+  });
 
   it.each(['1700000000000-0', '1700000000000-1', '1700000000000-2'])(
     'asks Redis for entries strictly after %s',

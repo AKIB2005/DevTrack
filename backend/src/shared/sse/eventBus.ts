@@ -10,6 +10,7 @@ import { createRedisConnection, getRedisClient, getRedisHealth, isRedisConfigure
 import { RedisStreamAdapter } from './redisStreamAdapter.js';
 import { TOTAL_SHARDS } from './shardRouter.js';
 import type { ShardedStreamEvent, ShardedAdapterMetrics } from './redisStreamAdapter.types.js';
+import { appendReplayV2 } from './replayWriterV2.js';
 
 // ─── Zod validation schemas for SSE event payloads ─────────────────────────
 const syncStartedPayload = z.object({
@@ -291,6 +292,9 @@ export interface SseEventEnvelope {
 
 export interface SseEvent {
   id?: string;
+  sequence?: number;
+  protocolVersion?: number;
+  generation?: string;
   type: SseEventType;
   timestamp: string;
   userId?: string;
@@ -374,13 +378,16 @@ class EventBus extends EventEmitter {
       // INV-08: Skip own echo (already delivered locally)
       if (streamEvent.origin === this.instanceId) return;
 
-      if (streamEvent.id) {
-        if (this.recentlyDeliveredIds.has(streamEvent.id)) return;
-        this.trackDeliveredId(streamEvent.id);
+      const identity = streamEvent.canonicalId ?? streamEvent.id;
+      if (identity && this.hasUserClients(streamEvent.userId)) {
+        const deliveryKey = JSON.stringify([streamEvent.canonicalId ? 'canonical' : 'shard', streamEvent.userId, identity]);
+        if (this.recentlyDeliveredIds.has(deliveryKey)) return;
+        this.trackDeliveredId(deliveryKey);
       }
 
       const sseEvent: SseEvent = {
-        id: streamEvent.id,
+        id: streamEvent.canonicalId,
+        ...(streamEvent.protocolVersion === 2 ? { protocolVersion: 2, generation: streamEvent.generation, sequence: streamEvent.sequence } : {}),
         type: streamEvent.type,
         timestamp: streamEvent.timestamp,
         userId: streamEvent.userId,
@@ -398,6 +405,21 @@ class EventBus extends EventEmitter {
       const first = this.recentlyDeliveredIds.values().next().value;
       if (first) this.recentlyDeliveredIds.delete(first);
     }
+  }
+
+  private hasUserClients(userId: string): boolean {
+    for (const client of this.clients.values()) {
+      if (client.userId === userId) return true;
+    }
+    return false;
+  }
+
+  private isCanonicalDuplicate(userId: string, id: string): boolean {
+    if (!this.hasUserClients(userId)) return false;
+    const key = JSON.stringify(['canonical', userId, id]);
+    if (this.recentlyDeliveredIds.has(key)) return true;
+    this.trackDeliveredId(key);
+    return false;
   }
 
   // ─── Redis pub/sub for horizontal scaling ─────────────────────────────────
@@ -452,9 +474,10 @@ class EventBus extends EventEmitter {
 
       (subscriber as any).on('message', (_channel: string, message: string) => {
         try {
-          const parsed = JSON.parse(message) as { origin?: string; event?: SseEvent } & SseEvent & TraceCarrier;
+          const parsed = JSON.parse(message) as { origin?: string; event?: SseEvent; canonicalId?: string } & SseEvent & TraceCarrier;
           const event = parsed.event ?? parsed;
           if (parsed.origin === this.instanceId) return;
+          if (parsed.canonicalId && event.userId && this.isCanonicalDuplicate(event.userId, parsed.canonicalId)) return;
           // Keep delivery synchronous for messages from peers that do not send trace context.
           if (!parsed.event || !parsed.traceparent) {
             this.publishLocal(event, event.userId);
@@ -523,19 +546,22 @@ class EventBus extends EventEmitter {
     );
   }
 
-  private async publishToRedis(event: SseEvent): Promise<void> {
+  private async publishToRedis(event: SseEvent, canonicalId?: string): Promise<void> {
     if (!this.streamAdapter.hasConfiguredRedis()) return;
     await runTraceOperation('sse.publish', async () => {
       // 1. Publish to sharded Redis Streams for horizontal scaling
       await this.streamAdapter.publishEvent({
+        canonicalId,
+        protocolVersion: event.protocolVersion,
+        generation: event.generation,
         origin: this.instanceId,
         userId: event.userId || 'system',
         type: event.type,
-        sequence: 0,
+        sequence: event.protocolVersion === 2 ? event.sequence ?? 0 : 0,
         timestamp: event.timestamp || new Date().toISOString(),
         payload: event.payload || {},
       });
-      const payload = JSON.stringify({ origin: this.instanceId, event, ...captureTraceContext() });
+      const payload = JSON.stringify({ origin: this.instanceId, event, canonicalId, ...captureTraceContext() });
       if (this.redisPublisher && (this.redisPublisher as any).status === 'ready') {
         await (this.redisPublisher as any).publish(SSE_CHANNEL, payload);
       } else if (getRedisHealth().status === 'connected') {
@@ -639,14 +665,16 @@ class EventBus extends EventEmitter {
   // Event emission — userId-scoped (user only sees their own events)
   // ---------------------------------------------------------------------------
 
-  publish(event: SseEvent, targetUserId?: string): void {
+  publish(event: SseEvent, targetUserId?: string, canonicalId?: string): void {
     this.eventsPublished++;
 
     // Local delivery (same instance)
-    this.publishLocal(event, targetUserId);
+    if (!canonicalId || !targetUserId || !this.isCanonicalDuplicate(targetUserId, canonicalId)) {
+      this.publishLocal(event, targetUserId);
+    }
 
     // Cross-instance delivery via Redis pub/sub
-    void this.publishToRedis(event);
+    void this.publishToRedis(event, canonicalId);
 
     logger.debug('[sse] Event published', {
       event: 'sse_event_published',
@@ -1106,6 +1134,19 @@ class EventBus extends EventEmitter {
     }
     
     const redis = getRedisClient();
+    const streamKey = `sse:stream:${userId}`;
+    if (process.env.SSE_V2_WRITER_ENABLED === 'true') {
+      const timestamp = new Date().toISOString();
+      const result = await appendReplayV2(redis, streamKey, {
+        type, payload: validatedPayload, timestamp,
+        correlationId: correlationId || randomUUID(), schemaVersion: schemaVersion || 1,
+      });
+      await redis.xtrim(streamKey, 'MAXLEN', '~', 100);
+      this.publish({ id: result.id, type, timestamp, userId, payload: validatedPayload,
+        stats: validatedPayload as SseEvent['stats'], sequence: result.sequence,
+        protocolVersion: 2, generation: result.generation }, userId, result.id);
+      return;
+    }
     
     // Get next sequence number for this user
     const sequenceKey = `sse:seq:${userId}`;
@@ -1117,7 +1158,6 @@ class EventBus extends EventEmitter {
     const fallbackId = `${userId}-${sequence}-${Date.now()}`;
 
     // Log to Redis stream for backfill (5 min retention, max 100 entries)
-    const streamKey = `sse:stream:${userId}`;
     const streamId = await redis.xadd(
       streamKey,
       '*',
@@ -1154,6 +1194,7 @@ class EventBus extends EventEmitter {
 
     // Also publish to horizontal sharded streams
     void this.streamAdapter.publishEvent({
+      canonicalId: typeof streamId === 'string' && streamId ? streamId : undefined,
       origin: this.instanceId,
       userId,
       type,
@@ -1174,7 +1215,8 @@ class EventBus extends EventEmitter {
         stats: validatedPayload as SseEvent['stats'],
         payload: validatedPayload, // Include payload for full compatibility
       },
-      userId
+      userId,
+      typeof streamId === 'string' && streamId ? streamId : undefined
     );
   }
 
