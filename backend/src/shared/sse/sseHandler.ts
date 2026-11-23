@@ -33,6 +33,23 @@ export const MAX_REPLAY_EVENTS = 100;
 
 type StreamEntry = [string, string[]];
 
+// A single Redis operation prevents trimming or recreation between anchor verification and reading.
+export const READ_VERIFIED_REPLAY = `
+local anchor = redis.call('XRANGE', KEYS[1], ARGV[1], ARGV[1], 'COUNT', 1)
+if #anchor == 0 then return {0, {}} end
+return {1, redis.call('XRANGE', KEYS[1], '(' .. ARGV[1], '+', 'COUNT', 101)}
+`;
+
+type RecoveryReason = 'invalid_cursor' | 'cursor_unavailable' | 'replay_limit_exceeded' | 'replay_failed';
+
+function sendRecoveryRequired(controller: ReadableStreamDefaultController<Uint8Array>, reason: RecoveryReason): void {
+  try {
+    controller.enqueue(encoder.encode(`event: sse_recovery_required\ndata: ${JSON.stringify({ protocolVersion: 2, reason, replayComplete: false })}\n\n`));
+  } catch {
+    // A closed transport cannot receive a recovery signal.
+  }
+}
+
 /**
  * Pages through the stream after `afterId` until it is exhausted. Returns null when more than
  * MAX_REPLAY_EVENTS entries are waiting, so the caller can fall back to full state instead of
@@ -86,17 +103,55 @@ async function sendFullState(
 export async function replayMissedEvents(
   userId: string,
   lastEventId: string,
-  controller: ReadableStreamDefaultController<Uint8Array>
+  controller: ReadableStreamDefaultController<Uint8Array>,
+  replayProtocolV2 = false
 ): Promise<Set<string>> {
   const redis = getRedisClient();
   const streamKey = `sse:stream:${userId}`;
   const replayedIds = new Set<string>();
+  const v2 = replayProtocolV2;
 
   try {
     // Last-Event-ID is a full `<ms>-<seq>` stream id. A malformed or foreign id (an older
     // client, a fallback id) cannot be placed in the stream, so skip replay and resend full state.
     const lastStreamId = parseStreamId(lastEventId);
     const lastSequence = lastStreamId;
+
+    if (v2) {
+      if (!lastStreamId) {
+        sendRecoveryRequired(controller, 'invalid_cursor');
+        return replayedIds;
+      }
+      const result = await redis.eval(READ_VERIFIED_REPLAY, 1, streamKey, lastStreamId) as [number, StreamEntry[]];
+      if (!Array.isArray(result) || !Array.isArray(result[1]) || (result[0] !== 0 && result[0] !== 1)) {
+        throw new Error('Invalid verified replay response');
+      }
+      if (result[0] === 0) {
+        sendRecoveryRequired(controller, 'cursor_unavailable');
+        return replayedIds;
+      }
+      if (result[1].length > MAX_REPLAY_EVENTS) {
+        sendRecoveryRequired(controller, 'replay_limit_exceeded');
+        return replayedIds;
+      }
+      // Validate all entries before delivering any, so malformed data cannot produce a partial replay.
+      const frames = result[1].map(([id, fields]) => {
+        const values: Record<string, string> = {};
+        for (let i = 0; i < fields.length; i += 2) values[fields[i]] = fields[i + 1];
+        const sequence = Number(values.sequence);
+        if (!values.type || !values.timestamp || !Number.isSafeInteger(sequence) || sequence < 1 ||
+            (values.protocolVersion === '2' && !values.generation)) throw new Error('Invalid replay entry');
+        const payload = JSON.parse(values.payload);
+        const envelope = { id, type: values.type, sequence, timestamp: values.timestamp, userId, payload,
+          ...(values.protocolVersion === '2' && values.generation ? { protocolVersion: 2, generation: values.generation } : {}) };
+        return { id, frame: `id: ${id}\ndata: ${JSON.stringify(envelope)}\n\n` };
+      });
+      for (const { id, frame } of frames) {
+        controller.enqueue(encoder.encode(frame));
+        replayedIds.add(id);
+      }
+      return replayedIds;
+    }
 
     // Read every event strictly after that position, a page at a time
     const events = lastStreamId ? await readMissedEvents(redis, streamKey, lastStreamId) : [];
@@ -152,6 +207,7 @@ export async function replayMissedEvents(
       lastEventId,
       error,
     });
+    if (v2) sendRecoveryRequired(controller, 'replay_failed');
   }
 
   return replayedIds;
@@ -161,7 +217,8 @@ export function createSseStream(
   userId: string,
   clientId: string,
   requestId: string,
-  lastEventId?: string
+  lastEventId?: string,
+  replayProtocolV2 = false
 ): ReadableStream<Uint8Array> {
   let controllerRef: ReadableStreamDefaultController<Uint8Array> | null = null;
 
@@ -226,7 +283,7 @@ export function createSseStream(
 
       // Replay missed events if Last-Event-ID header present
       if (lastEventId) {
-        const replayedIds = await replayMissedEvents(userId, lastEventId, controller);
+        const replayedIds = await replayMissedEvents(userId, lastEventId, controller, replayProtocolV2);
         replaying = false;
         // An event written to the stream just before the read can be both replayed and held back.
         const decoder = new TextDecoder();
@@ -315,7 +372,7 @@ export async function handleSseRequest(req: Request, res: Response): Promise<voi
 
   eventBus.startHeartbeat();
 
-  const stream = createSseStream(userId, clientId, requestId, lastEventId);
+  const stream = createSseStream(userId, clientId, requestId, lastEventId, req.query.replayProtocol === '2');
 
   stream.pipeTo(
     new WritableStream({

@@ -238,6 +238,56 @@ describe('replayMissedEvents', () => {
 
   beforeEach(() => redis.xrange.mockClear());
 
+  describe('verified v2 replay', () => {
+    beforeEach(() => { redis.eval.mockReset(); });
+
+    it('replays a verified anchor suffix with v2 metadata', async () => {
+      redis.eval.mockResolvedValueOnce([1, [['2-0', ['type', 'runtime_state_patch', 'sequence', '2',
+        'timestamp', 't', 'payload', '{}', 'protocolVersion', '2', 'generation', 'g']]]]);
+      const { ctl, chunks } = controller();
+      expect([...await replayMissedEvents('u', '1-0', ctl, true)]).toEqual(['2-0']);
+      expect(chunks[0]).toContain('"generation":"g"');
+      expect(chunks[0]).toContain('"sequence":2');
+    });
+
+    it.each([
+      ['invalid_cursor', 'bad', undefined],
+      ['cursor_unavailable', '1-0', [0, []]],
+      ['replay_limit_exceeded', '1-0', [1, Array.from({ length: 101 }, () => entry('2-0', 2))]],
+      ['replay_failed', '1-0', [1, [['2-0', ['type', 'x', 'sequence', '2', 'timestamp', 't', 'payload', '{']]]]],
+      ['replay_failed', '1-0', [1, [['2-0', ['type', 'x', 'sequence', '2', 'timestamp', 't', 'payload', '{}', 'protocolVersion', '2']]]]],
+    ])('signals %s without advancing the cursor', async (reason, cursor, result) => {
+      if (result) redis.eval.mockResolvedValueOnce(result);
+      const { ctl, chunks } = controller();
+      expect((await replayMissedEvents('u', cursor as string, ctl, true)).size).toBe(0);
+      expect(chunks).toHaveLength(1);
+      expect(chunks[0]).toContain('event: sse_recovery_required\n');
+      expect(chunks[0]).toContain(`"reason":"${reason}"`);
+      expect(chunks[0]).toContain('"replayComplete":false');
+      expect(chunks[0]).not.toMatch(/^id:/m);
+    });
+
+    it('signals Redis failures and accepts an empty verified suffix', async () => {
+      const first = controller();
+      redis.eval.mockRejectedValueOnce(new Error('Redis unavailable'));
+      await replayMissedEvents('u', '1-0', first.ctl, true);
+      expect(first.chunks[0]).toContain('"reason":"replay_failed"');
+      const second = controller();
+      redis.eval.mockResolvedValueOnce([1, []]);
+      await replayMissedEvents('u', '1-0', second.ctl, true);
+      expect(second.chunks).toEqual([]);
+    });
+
+    it('signals malformed data before delivering an earlier valid entry', async () => {
+      redis.eval.mockResolvedValueOnce([1, [entry('2-0', 2), ['3-0', ['payload', '{']]]]);
+      const { ctl, chunks } = controller();
+      expect((await replayMissedEvents('u', '1-0', ctl, true)).size).toBe(0);
+      expect(chunks).toHaveLength(1);
+      expect(chunks[0]).toContain('"reason":"replay_failed"');
+      expect(chunks[0]).not.toMatch(/^id:/m);
+    });
+  });
+
   it('preserves v2 metadata in replay', async () => {
     redis.xrange.mockResolvedValueOnce([['1700000000001-0', [
       'type', 'runtime_state_patch', 'sequence', '1', 'payload', '{}', 'timestamp', 't',
